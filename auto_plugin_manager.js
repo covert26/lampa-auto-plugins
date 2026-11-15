@@ -425,6 +425,9 @@
 
       if (ready && populated) {
         log('start (tries=' + tries + ', populated=' + populated + ')');
+        // Статусный пинг: подтверждает, что менеджер реально запущен и его
+        // канал Lampa.Noty.show работает (видно на экране).
+        notify('Менеджер плагинов активен: проверяю плагины…');
         fixFromLampa();
         return;
       }
