@@ -38,9 +38,11 @@
 (function () {
   'use strict';
 
-  // Защита от повторного запуска за сессию.
-  if (window.__auto_plugin_manager_ran) return;
-  window.__auto_plugin_manager_ran = true;
+  // Защита от повторного запуска ТОЛЬКО в рамках одного контекста.
+  // ВАЖНО: Lampa при установке плагина оборачивает код и перезагружает его
+  // (ленивая инициализация), из-за чего жёсткий ранний return мог обрывать
+  // выполнение. Используем мягкую защиту (не выходим до готовности Lampa).
+  var APM_TOKEN = 'apm_' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
 
   var TIMEOUT_MS = 6000;                       // 6 секунд на проверку плагина
   var SELF_MARK = 'auto_plugin_manager';       // маркер для защиты от самоудаления
@@ -72,6 +74,25 @@
     // репозиториев. Добавлять URL сюда можно только после проверки
     // HTTP 200 + читаемого кода.
   ];
+
+  // Признаки заведомо мёртвых / рекламных источников (проверено ADB-logcat
+  // и HTTP-доступностью с приставки):
+  //   z01.online | bwa.ad | bwa.lampa.tv | bwa.lampa.to | bwa.to |
+  //   lampa.stream/modss | skaz.tv/amedia | lampa.mx/hdrezka | jacred.ru
+  // Их всегда удаляем и НИКОГДА не восстанавливаем.
+  var BAD_SIGNATURES = [
+    'z01.online', 'bwa.ad', 'bwa.lampa.tv', 'bwa.lampa.to', 'bwa.to',
+    'lampa.stream/modss', 'skaz.tv/amedia', 'lampa.mx/hdrezka',
+    'jacred.ru/init.yaml', 'cub.red/plugin/torrent'
+  ];
+
+  // Проверка, что URL точно на доверенном хосте из белого списка.
+  function isTrustedHost(url) {
+    for (var i = 0; i < WHITELIST.length; i++) {
+      if (WHITELIST[i].url === url) return true;
+    }
+    return false;
+  }
 
   // Базовый набор для первого запуска (просмотр в 1080p).
   var BASE_SET = [WHITELIST[0], WHITELIST[1]];
@@ -122,6 +143,7 @@
     var u = (url || '').toLowerCase();
     if (isSelf(u)) return 'self';
     if (isLocal(u)) return 'local';
+    if (isBadUrl(u)) return 'bad'; // заведомо мёртвый/рекламный источник
     if (u.indexOf('tmdb') !== -1) return 'tmdb';
     if (u.indexOf('online') !== -1 || u.indexOf('balancer') !== -1 ||
         u.indexOf('filmix') !== -1 || u.indexOf('kinopub') !== -1 ||
@@ -133,6 +155,22 @@
         u.indexOf('rutracker') !== -1 || u.indexOf('parser') !== -1) return 'torrent';
     if (u.indexOf('/store/') !== -1 || u.indexOf('store.js') !== -1) return 'store';
     return 'unknown';
+  }
+
+  // Заведомо мёртвый / рекламный источник (см. BAD_SIGNATURES).
+  function isBadUrl(url) {
+    var u = (url || '').toLowerCase();
+    for (var i = 0; i < BAD_SIGNATURES.length; i++) {
+      if (u.indexOf(BAD_SIGNATURES[i]) !== -1) return true;
+    }
+    return false;
+  }
+
+  // Должен ли плагин быть удалён: явная «плохая» подпись + мёртвый по данным Lampa.
+  function shouldRemove(url, deadSet) {
+    if (isSelf(url) || isLocal(url) || isTrustedHost(url)) return false;
+    if (isBadUrl(url)) return true;
+    return !!(deadSet && deadSet[url]);
   }
 
   // ==================================================================
@@ -170,25 +208,54 @@
   }
 
   // ==================================================================
-  // ИСТОЧНИК ИСТИНЫ — РЕЗУЛЬТАТ САМОЙ LAMPA
+  // ИСТОЧНИК ИСТИНЫ — РЕЗУЛЬТАТ САМОЙ LAMPA (форк Lampa MX / top.rootu.lampa)
   // ==================================================================
-  // Возвращает массив URL мёртвых плагинов, либо null, если API недоступно.
-  function lampaDead() {
+  // Реальный API форка (см. app.min.js, объект Plugins):
+  //   Lampa.Plugins.errors()  -> _noload : URL, которые НЕ загрузились
+  //   Lampa.Plugins.loaded()  -> _created: URL, которые успешно создались
+  //   Lampa.Plugins.get()/init -> доступ к _awaits/_loaded (полный список)
+  // ВАЖНО: _noload наполняется асинхронно по мере ошибок загрузки, поэтому
+  // снимать мёртвых имеет смысл только ПОСЛЕ того, как Lampa вызвала load().
+  function lampaErrors() {
     try {
-      if (!window.Lampa || !Lampa.Plugins) return null;
-      var errs = (Lampa.Plugins.errors && Lampa.Plugins.errors()) || [];
-      var awaits = (Lampa.Plugins.awaits && Lampa.Plugins.awaits()) || [];
-      var loaded = (Lampa.Plugins.loaded && Lampa.Plugins.loaded()) || [];
-      var dead = {};
-
-      errs.forEach(function (u) { dead[u] = true; });
-      awaits.forEach(function (u) {
-        if (loaded.indexOf(u) === -1) dead[u] = true; // не создался -> мёртв
-      });
-      return Object.keys(dead);
+      if (!window.Lampa || !Lampa.Plugins || !Lampa.Plugins.errors) return null;
+      return (Lampa.Plugins.errors() || []).slice();
     } catch (e) {
-      log('lampaDead error', e);
+      log('lampaErrors error', e);
       return null;
+    }
+  }
+
+  // Список активных плагинов из хранилища (формат {url,status} или строка).
+  function lampaActive() {
+    var urls = [];
+    try {
+      var v = [];
+      if (window.Lampa && Lampa.Storage) {
+        v = Lampa.Storage.get('plugins', []);
+        if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) { v = []; } }
+      }
+      if (!Array.isArray(v)) v = [];
+      v.forEach(function (a) {
+        var u = (typeof a === 'string') ? a : (a && a.url);
+        if (typeof u === 'string' && u) urls.push(u);
+      });
+    } catch (e) {
+      log('lampaActive error', e);
+    }
+    return urls;
+  }
+
+  // Ждём, пока Lampa реально начнёт загрузку плагинов (появится _awaits).
+  function lampaReady() {
+    try {
+      if (!window.Lampa || !Lampa.Plugins) return false;
+      var loaded = (Lampa.Plugins.loaded && Lampa.Plugins.loaded()) || [];
+      var errs = (Lampa.Plugins.errors && Lampa.Plugins.errors()) || [];
+      // Готово, если уже есть хоть один загруженный/ошибочный ИЛИ есть активный список.
+      return (loaded.length > 0 || errs.length > 0 || lampaActive().length > 0);
+    } catch (e) {
+      return false;
     }
   }
 
@@ -277,17 +344,31 @@
   // ==================================================================
   // ДЕЙСТВИЯ
   // ==================================================================
+  // ВАЖНО (реальная семантика форка):
+  //   Plugins.remove(plug) -> Arrays.remove(_loaded, plug); Storage.set('plugins', _loaded)
+  //   где _loaded — массив ОБЪЕКТОВ {url,status}. Передача строки в remove()
+  //   не сработает (indexOf объекта != строка), а Storage.set(_loaded) может
+  //   затереть нашу правильную фильтрацию устаревшими данными.
+  //   Поэтому: фильтруем Storage, затем синхронизируем внутренний _loaded
+  //   форка, передавая ему ОБЪЕКТ, который реально лежит в списке.
   function removeByUrl(url) {
     if (isSelf(url)) {
       log('self-protection: skip remove', url);
-      return;
+      return false;
     }
+
     var list = rawList();
     var filtered = list.filter(function (a) { return a.url !== url; });
-    if (filtered.length !== list.length) {
-      saveList(filtered);
-      log('removed', url);
-    }
+    if (filtered.length === list.length) return false; // нечего удалять
+
+    // Наш отфильтрованный список пишем в Storage. Форк при следующем
+    // чтении (Plugins.init/modify) подхватит именно его. Вызывать
+    // Plugins.remove(url) НЕЛЬЗЯ: он пишет обратно в Storage свой устаревший
+    // _loaded и затирает нашу фильтрацию (проверено симуляцией).
+    saveList(filtered);
+
+    log('removed', url);
+    return true;
   }
 
   function install(entry, deadSet) {
@@ -302,48 +383,94 @@
       return;
     }
 
-    // Сохраняем в хранилище, чтобы плагин пережил перезапуск Lampa.
-    var list = rawList();
-    list.push({ url: entry.url, status: 1 });
-    saveList(list);
     log('installing', entry.url);
 
-    // Загружаем сразу (заработает без перезапуска) + уведомление.
+    // Пытаемся инициализировать через официальный API форка (заработает
+    // без перезапуска). ВАЖНО: push() в форке пишет в Storage свой _loaded,
+    // который может быть устаревшим, поэтому Storage фиксируем ПОСЛЕ него.
+    var usedApi = false;
+    try {
+      if (window.Lampa && Lampa.Plugins && Lampa.Plugins.push) {
+        Lampa.Plugins.push({ url: entry.url, status: 1 });
+        usedApi = true;
+      }
+    } catch (e) {
+      log('Plugins.push error', e);
+    }
+
+    // Гарантированно сохраняем итоговый список в Storage (чтобы не потерять
+    // и результат установки, и предыдущие удаления).
+    var list = rawList();
+    if (list.map(function (a) { return a.url; }).indexOf(entry.url) === -1) {
+      list.push({ url: entry.url, status: 1 });
+    }
+    saveList(list);
+
+    var told = false;
     probe(entry.url, function (alive) {
+      if (told) return;
+      told = true;
       if (alive) notify('Установлен рабочий плагин: ' + entry.name);
       else notify('Не удалось загрузить плагин: ' + entry.name);
     });
+
+    if (usedApi) {
+      // API форка сам покажет 'plugins_add_success'/'plugins_check_fail',
+      // поэтому дублирующее уведомление через probe не критично.
+      log('installed via Plugins.push', entry.url);
+    }
   }
 
   // ==================================================================
   // ОСНОВНАЯ ЛОГИКА
   // ==================================================================
   function fixFromLampa() {
-    var dead = lampaDead();
-    if (dead === null) {
+    // Мёртвые = _noload (официальный errors()) + наши «плохие» подписи.
+    var errs = lampaErrors();
+    if (errs === null) {
       log('Lampa.Plugins API недоступно -> резервная проверка');
       fixByProbe();
       return;
     }
 
-    log('мёртвые (по данным Lampa):', dead);
-
     var deadMap = {};
-    dead.forEach(function (u) { deadMap[u] = true; });
+    errs.forEach(function (u) { deadMap[u] = true; });
 
-    dead.forEach(function (raw) {
-      if (isSelf(raw) || isLocal(raw)) return;
+    // Активный список берём из Storage (формат строк/объектов).
+    var active = lampaActive();
+    log('active:', active);
+    log('errors(_noload):', errs);
 
-      removeByUrl(raw);
-      notify('Нерабочий плагин [' + nameFromUrl(raw) + '] удалён');
+    var wantedCats = {};
+    var removed = 0;
 
-      var cat = categoryOf(raw);
-      var rep = replacementFor(cat, deadMap);
-      if (rep) {
-        install(rep, deadMap);
-      } else {
-        log('нет проверенной замены для категории', cat, 'для', raw);
+    // Проходим по ВСЕМ активным URL: удаляем мёртвые и «плохие».
+    active.forEach(function (u) {
+      if (!shouldRemove(u, deadMap)) return;
+      if (removeByUrl(u)) {
+        removed++;
+        notify('Удалён нерабочий плагин: ' + nameFromUrl(u));
       }
+      var cat = categoryOf(u);
+      if (cat === 'online' || cat === 'tmdb') wantedCats[cat] = true;
+    });
+
+    // Также учитываем мёртвые, которых уже нет в активном списке (из _noload).
+    errs.forEach(function (u) {
+      if (isSelf(u) || isLocal(u) || isTrustedHost(u)) return;
+      if (active.indexOf(u) !== -1) return; // уже обработан выше
+      removeByUrl(u);
+      var cat = categoryOf(u);
+      if (cat === 'online' || cat === 'tmdb') wantedCats[cat] = true;
+    });
+
+    log('удалено плагинов:', removed);
+
+    // Для каждой нужной категории ставим проверенную замену.
+    Object.keys(wantedCats).forEach(function (cat) {
+      var rep = replacementFor(cat, deadMap);
+      if (rep) install(rep, deadMap);
+      else log('нет проверенной замены для категории', cat);
     });
 
     ensureBaseSet(deadMap);
@@ -359,6 +486,17 @@
         return;
       }
       var u = urls[i++];
+
+      // Явно плохие URL не проверяем сетью — удаляем сразу.
+      if (isBadUrl(u) && !isTrustedHost(u)) {
+        if (removeByUrl(u)) notify('Удалён нерабочий плагин: ' + nameFromUrl(u));
+        var cat0 = categoryOf(u);
+        var rep0 = (cat0 !== 'bad') ? replacementFor(cat0, null) : null;
+        if (rep0) install(rep0, null);
+        next();
+        return;
+      }
+
       log('probe', u);
 
       probe(u, function (alive) {
@@ -367,7 +505,7 @@
           return;
         }
         removeByUrl(u);
-        notify('Нерабочий плагин [' + nameFromUrl(u) + '] удалён');
+        notify('Удалён нерабочий плагин: ' + nameFromUrl(u));
 
         var cat = categoryOf(u);
         var rep = replacementFor(cat, null);
@@ -377,15 +515,18 @@
     })();
   }
 
-  // Первый запуск: ставим базовый набор, если нет рабочего балансера.
+  // Базовый набор: ставим при КАЖДОМ запуске, если категория не покрыта
+  // рабочим плагином. Флаг INIT_FLAG больше не блокирует установку —
+  // иначе после первого (возможно неудачного) запуска замены не ставились.
   function ensureBaseSet(deadSet) {
-    var firstRun = false;
-    try {
-      firstRun = !(window.Lampa && Lampa.Storage && Lampa.Storage.get(INIT_FLAG, false));
-    } catch (e) {
-      firstRun = true;
+    var added = [];
+    for (var i = 0; i < BASE_SET.length; i++) {
+      var b = BASE_SET[i];
+      if (currentUrls().indexOf(b.url) !== -1) continue;
+      if (categoryCoveredWorking(b.category, deadSet)) continue;
+      install(b, deadSet);
+      added.push(b.name);
     }
-    if (!firstRun) return;
 
     try {
       if (window.Lampa && Lampa.Storage && Lampa.Storage.set) {
@@ -393,17 +534,8 @@
       }
     } catch (e) {}
 
-    var installedAny = false;
-    for (var i = 0; i < BASE_SET.length; i++) {
-      var b = BASE_SET[i];
-      if (currentUrls().indexOf(b.url) !== -1) continue;
-      if (categoryCoveredWorking(b.category, deadSet)) continue;
-      install(b, deadSet);
-      installedAny = true;
-    }
-
-    if (installedAny) {
-      notify('Базовый набор для 1080p установлен: Online Mod + TMDB Proxy');
+    if (added.length) {
+      notify('Добавлены рабочие плагины: ' + added.join(', '));
     }
   }
 
@@ -417,25 +549,23 @@
       tries++;
 
       var ready = !!(window.Lampa && Lampa.Storage && Lampa.Noty && Lampa.Plugins);
-      var populated = false;
-      try {
-        populated = !!(Lampa.Plugins && Lampa.Plugins.awaits &&
-          (Lampa.Plugins.awaits() || []).length > 0);
-      } catch (e) {}
+      var canFix = ready && lampaReady();
 
-      if (ready && populated) {
-        log('start (tries=' + tries + ', populated=' + populated + ')');
-        // Статусный пинг: подтверждает, что менеджер реально запущен и его
-        // канал Lampa.Noty.show работает (видно на экране).
+      if (tries % 10 === 0 || canFix) {
+        log('wait (tries=' + tries + ', ready=' + ready +
+            ', canFix=' + canFix + ')');
+      }
+
+      if (canFix) {
+        log('start ok (tries=' + tries + ')');
         notify('Менеджер плагинов активен: проверяю плагины…');
-        fixFromLampa();
+        runFix();
         return;
       }
 
       if (tries > MAX_WAIT) {
-        log('timeout (populated=' + populated + ')');
-        if (window.Lampa && Lampa.Plugins) fixFromLampa();
-        else fixByProbe();
+        log('timeout (ready=' + ready + ')');
+        runFix();
         return;
       }
 
@@ -443,5 +573,32 @@
     })();
   }
 
-  start();
+  // Запускает проверку и повторяет её ещё пару раз, потому что _noload
+  // в форке наполняется асинхронно по мере ошибок загрузки.
+  function runFix() {
+    var passes = 0;
+    function once() {
+      passes++;
+      try {
+        if (window.Lampa && Lampa.Plugins) fixFromLampa();
+        else fixByProbe();
+      } catch (e) {
+        log('runFix error (pass ' + passes + ')', e);
+      }
+      if (passes < 3) setTimeout(once, 4000);
+    }
+    once();
+  }
+
+  // Запуск: если DOM уже готов — сразу, иначе по событию.
+  function boot() {
+    log('boot ' + APM_TOKEN);
+    try { start(); } catch (e) { log('start error', e); }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
 })();
